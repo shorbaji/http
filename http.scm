@@ -540,8 +540,7 @@
 
 (define (make-http-server handler)
   (lambda (ignore)
-    (let* ((l (ssl-listen* hostname: "127.0.0.1"
-			   port: 8000
+    (let* ((l (ssl-listen* port: 8000
 			   protocol: 'tlsv12
 			   certificate: "server.pem"
 			   private-key: "server.key"
