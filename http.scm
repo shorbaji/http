@@ -1,210 +1,5 @@
-(module http-stream
-    (make-stream stream-recv stream-send stream-accepts?)
-  (import chicken scheme)
-  (use srfi-1 defstruct data-structures)
-  (use http-frame)
+(import chicken scheme)
 
-  (defstruct stream
-    (state 'idle)
-    (hbls '())
-    (db "")
-    (local-ws 65535)
-    (peer-ws 65535)
-    (ec #f))
-
-  (define recv-transition-table
-    (map cons
-	 '(idle open reserved-local reserved-remote half-closed-remote half-closed-local)
-	 '(((push-promise . reserved-remote)  (headers . open))
-	   ((end-stream . half-closed-remote)  (rst-stream . closed))
-	   ((rst-stream . closed))
-	   ((headers . half-closed-local)  (rst-stream . closed))
-	   ((rst-stream . closed))
-	   ((end-stream . closed)  (rst-stream . closed)))))
-
-  (define send-transition-table
-    (map cons
-	 '(idle open reserved-local reserved-remote half-closed-remote half-closed-local)
-	 '(((push-promise . reserved-local)  (headers . open))
-	   ((end-stream . half-closed-local)  (rst-stream . closed))
-	   ((headers . half-closed-remote)  (rst-stream . closed))
-	   ((rst-stream . closed))
-	   ((end-stream . closed)  (rst-stream . closed))
-	   ((rst-stream . closed)))))
-  
-  (define (stream-transition state t table)
-    (or (alist-ref t (alist-ref state table))
-	state))
-
-  (define (stream-accepts? s t)
-    (let* ((state (stream-state s)))
-      (member t (case state
-		  ((idle)            '(headers push-promise priority))
-		  ((reserved-local)  '(priority rst-stream window-update))
-		  ((reserved-remote) '(headers rst-stream priority))
-		  (else (list t))))))
-  
-;;; stream-recv
-  ;; 
-  (define (stream-recv s f handler)
-    (let* ((state (stream-state s))
-	   (hbls (stream-hbls s))
-	   (db (stream-db s))
-	   (local-ws (stream-local-ws s))
-	   (peer-ws (stream-peer-ws s))
-	   (ec (stream-ec s))
-	   (t (car f))
-	   (id (cadr f)))
-
-      (define (continuation-hbfs)
-	(let lp ((b ""))
-	  (let* ((f (read-frame))
-		 (t (car f))
-		 (cid (cadr f)))
-	    (if (and (eq? 'continuation t)
-		     (eq? cid id))
-		(let* ((chbf (caddr f))
-		       (ceh (cadddr f)))
-		  (if ceh
-		      (lp (conc b chbf))
-		      (conc b chbf)))))))
-
-      (define (transition tr)
-	(set! state (stream-transition state tr recv-transition-table)))
-      
-      (define (transition-on-es es)
-	(if es (transition 'end-stream)))
-
-      (define (stream-error ec)
-	(stream-send s `(rst-stream ,id ,ec)))
-      
-;;;
-      (if (or (and (eq? t 'data)
-		   (not (member state '(open half-closed-local))))
-	      (not (member t (case state
-			       ((half-closed-remote) '(window-update priority rst-stream))
-			       ((closed) '(priority))
-			       (else (list t))))))
-	  (stream-error 'stream-closed))
-      
-      
-      (transition t)
-      
-      (let ((fn (case (car f)
-		  ((data)           (lambda (data es)
-				      (transition-on-es es)
-				      (set! db (conc db data))))
-		  ((headers)        (lambda (hbf eh es esdw)
-				      (let* ((hb (if eh hbf (conc hbf (continuation-hbfs)))))
-					(transition-on-es es)
-					(set! hbls (cons hb hbls)))))
-		  ((rst-stream)     (lambda (fec)
-				      (set! ec fec)))
-		  ((priority)       (lambda (e sd w)
-				      '()))
-		  ((window-update)  (lambda (wsi)
-				      (if (zero? wsi) (stream-error 'protocol-error))
-				      (set! peer-ws (+ wsi peer-ws))))
-		  ((push-promise)   (lambda (-promise psid hbf eh)
-				      '())))))
-	(apply fn (cddr f)))
-
-      (if (and (member state '(half-closed-remote closed))
-	       (or (not ec)
-		   (zero? ec)))
-	  (handler id hbls db))
-
-      (update-stream s state: state hbls: hbls db: db ec: ec)))
-
-  
-;;; stream send
-
-  (define (stream-send s f)
-    (let* ((t (car f))
-	   (state (stream-state s)))
-
-      (define (transition tr)
-	(set! state (stream-transition state tr send-transition-table)))
-      
-      (define (transition-on-es es)
-	(if es (transition 'end-stream)))
-
-
-      (define (data d es)
-	(transition-on-es es))
-
-      (define (headers hbf eh es)
-	(transition-on-es es))
-
-      (define (rst-stream ls ec dd)
-	'())
-
-      (transition t)      
-      (apply (alist-ref t
-			`((data . ,data)
-			  (headers . ,headers)
-			  (rst-stream . ,rst-stream)))
-	     (cddr f))
-      (update-stream s state: state))))
-
-(module http-request
-    (make-request request-authority request-pseudo-headers request-all-headers request-headers
-		  make-request-with-headers-and-body)
-
-  (import chicken scheme)
-  (use srfi-1 data-structures defstruct)
-
-  (defstruct request
-    method host port path
-    (scheme "http")
-    (headers '())
-    (body ""))
-
-  (define (request-authority req)
-    (conc (request-host req)
-	  (if (request-port req)
-	      (conc ":" (request-port req))
-	      "")))
-  
-  (define (request-pseudo-headers req)
-    `((:method . ,(conc (request-method req)))
-      (:scheme . ,(request-scheme req))
-      (:path . ,(request-path req))
-      (:authority . ,(request-authority req))))
-
-  (define (request-all-headers req)
-    (append (request-pseudo-headers req)
-	    (request-headers req)))
-
-  (define (make-request-with-headers-and-body h b)
-    (let* ((m (alist-ref ':method h))
-	   (p (alist-ref ':path h))
-	   (a (alist-ref ':authority h))
-	   (s (alist-ref ':scheme h))
-	   (h (fold alist-delete h '(:method :path :authority :scheme))))
-      (make-request method: m
-		    scheme: s
-		    authority: a
-		    path: p
-		    headers: h
-		    body: b))))
-
-(module http-response
-    (make-response response-status response-headers response-body make-response-with-headers-and-body response-all-headers)
-
-  (import chicken scheme)
-  (use srfi-1 defstruct data-structures)
-  
-  (defstruct response status (headers '()) body request)
-
-  (define (response-all-headers res)
-    (cons `(:status . ,(->string (response-status res)))
-	  (response-headers res)))
-
-  (define (make-response-with-headers-and-body headers body)
-    (make-response status: (alist-ref ':status headers)
-		   headers: (alist-delete ':status headers)
-		   body: body)))
 ;; TODO
 ;;
 ;; Section 3.2   starting HTTP/2 with https
@@ -239,14 +34,208 @@
 ;;;
 
 (module http2
-    (make-http-server-connection http-connection-listen http-connection-write-response)
-
+    (http-connection-listen
+     make-http-server-connection http-connection-write-response
+     make-request make-request-with-headers-and-body request-pseudo-headers request-authority request-headers
+     request-method request-host request-port request-authority request-headers
+     make-response make-response-with-headers-and-body response-all-headers
+     response-status response-headers response-body)
   (import chicken scheme)
 
   (use srfi-1 data-structures defstruct extras)
   (use hpack http-frame)
-  (import http-response http-request http-stream)
-  (reexport http-request http-response)
+
+  ;; request
+  (defstruct request
+    method host port path
+    (scheme "http")
+    (headers '())
+    (body ""))
+
+  (define (request-authority req)
+    (conc (request-host req)
+	  (if (request-port req)
+	      (conc ":" (request-port req))
+	      "")))
+  
+  (define (request-pseudo-headers req)
+    `((:method . ,(conc (request-method req)))
+      (:scheme . ,(request-scheme req))
+      (:path . ,(request-path req))
+      (:authority . ,(request-authority req))))
+
+  (define (request-all-headers req)
+    (append (request-pseudo-headers req)
+	    (request-headers req)))
+
+  (define (make-request-with-headers-and-body h b)
+    (let* ((m (alist-ref ':method h))
+	   (p (alist-ref ':path h))
+	   (a (alist-ref ':authority h))
+	   (s (alist-ref ':scheme h))
+	   (h (fold alist-delete h '(:method :path :authority :scheme))))
+      (make-request method: m
+		    scheme: s
+		    authority: a
+		    path: p
+		    headers: h
+		    body: b)))
+
+  ;;; response
+  (defstruct response status (headers '()) body)
+
+  (define (response-all-headers res)
+    (cons `(:status . ,(->string (response-status res)))
+	  (response-headers res)))
+
+  (define (make-response-with-headers-and-body headers body)
+    (make-response status: (alist-ref ':status headers)
+		   headers: (alist-delete ':status headers)
+		   body: body))
+
+  ;;; stream
+  (defstruct stream
+    (state 'idle)
+    (hbls '())
+    (db "")
+    (local-ws 65535)
+    (peer-ws 65535)
+    (ec #f))
+
+  (define recv-transition-table
+    (map cons
+	 '(idle open reserved-local reserved-remote half-closed-remote half-closed-local)
+	 '(((push-promise . reserved-remote)  (headers . open))
+	   ((end-stream . half-closed-remote)  (rst-stream . closed))
+	   ((rst-stream . closed))
+	   ((headers . half-closed-local)  (rst-stream . closed))
+	   ((rst-stream . closed))
+	   ((end-stream . closed)  (rst-stream . closed)))))
+
+  (define send-transition-table
+    (map cons
+	 '(idle open reserved-local reserved-remote half-closed-remote half-closed-local)
+	 '(((push-promise . reserved-local)  (headers . open))
+	   ((end-stream . half-closed-local)  (rst-stream . closed))
+	   ((headers . half-closed-remote)  (rst-stream . closed))
+	   ((rst-stream . closed))
+	   ((end-stream . closed)  (rst-stream . closed))
+	   ((rst-stream . closed)))))
+
+  (define (stream-transition state t table)
+    (or (alist-ref t (alist-ref state table))
+	state))
+
+  (define (stream-accepts? s t)
+    (let* ((state (stream-state s)))
+      (member t (case state
+		  ((idle)            '(headers push-promise priority))
+		  ((reserved-local)  '(priority rst-stream window-update))
+		  ((reserved-remote) '(headers rst-stream priority))
+		  (else (list t))))))
+
+  ;;; stream-recv
+
+  (define (stream-recv s f handler)
+    (let* ((state (stream-state s))
+	   (hbls (stream-hbls s))
+	   (db (stream-db s))
+	   (local-ws (stream-local-ws s))
+	   (peer-ws (stream-peer-ws s))
+	   (ec (stream-ec s))
+	   (t (car f))
+	   (id (cadr f)))
+
+      (define (continuation-hbfs)
+	(let lp ((b ""))
+	  (let* ((f (read-frame))
+		 (t (car f))
+		 (cid (cadr f)))
+	    (if (and (eq? 'continuation t)
+		     (eq? cid id))
+		(let* ((chbf (caddr f))
+		       (ceh (cadddr f)))
+		  (if ceh
+		      (lp (conc b chbf))
+		      (conc b chbf)))))))
+
+      (define (transition tr)
+	(set! state (stream-transition state tr recv-transition-table)))
+    
+      (define (transition-on-es es)
+	(if es (transition 'end-stream)))
+
+      (define (stream-error ec)
+	(stream-send s `(rst-stream ,id ,ec)))
+    
+      (if (or (and (eq? t 'data)
+		   (not (member state '(open half-closed-local))))
+	      (not (member t (case state
+			       ((half-closed-remote) '(window-update priority rst-stream))
+			       ((closed) '(priority))
+			       (else (list t))))))
+	  (stream-error 'stream-closed))
+    
+    
+      (transition t)
+    
+      (let ((fn (case (car f)
+		  ((data)           (lambda (data es)
+				      (transition-on-es es)
+				      (set! db (conc db data))))
+		  ((headers)        (lambda (hbf eh es esdw)
+				      (let* ((hb (if eh hbf (conc hbf (continuation-hbfs)))))
+					(transition-on-es es)
+					(set! hbls (cons hb hbls)))))
+		  ((rst-stream)     (lambda (fec)
+				      (set! ec fec)))
+		  ((priority)       (lambda (e sd w)
+				      '()))
+		  ((window-update)  (lambda (wsi)
+				      (if (zero? wsi) (stream-error 'protocol-error))
+				      (set! peer-ws (+ wsi peer-ws))))
+		  ((push-promise)   (lambda (-promise psid hbf eh)
+				      '())))))
+	(apply fn (cddr f)))
+
+      (if (and (member state '(half-closed-remote closed))
+	       (or (not ec)
+		   (zero? ec)))
+	  (handler id hbls db))
+
+      (update-stream s state: state hbls: hbls db: db ec: ec)))
+
+
+  ;;; stream send
+
+  (define (stream-send s f)
+    (let* ((t (car f))
+	   (state (stream-state s)))
+
+      (define (transition tr)
+	(set! state (stream-transition state tr send-transition-table)))
+    
+      (define (transition-on-es es)
+	(if es (transition 'end-stream)))
+
+
+      (define (data d es)
+	(transition-on-es es))
+
+      (define (headers hbf eh es)
+	(transition-on-es es))
+
+      (define (rst-stream ls ec dd)
+	'())
+
+      (transition t)      
+      (apply (alist-ref t
+			`((data . ,data)
+			  (headers . ,headers)
+			  (rst-stream . ,rst-stream)))
+	     (cddr f))
+      (update-stream s state: state)))
+
   (define client-initial-settings
     `((SETTINGS-HEADER-TABLE-SIZE       . 4096)
       (SETTINGS-ENABLE-PUSH             . 1)
@@ -493,31 +482,34 @@
 	    conn
 	    (conn-response->frames conn id res))))
 
-  (define (conn-read-client-settings conn)
+  (define http-client-preface "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+
+  (define (http-connection-read-client-preface conn)
+    (let* ((s (read-string 24)))
+      (if (string=? http-client-preface s)
+	  conn
+	  (conn-connection-error conn 0 'protocol-error "bad client preface")))
+    conn)
+
+
+  (define (http-connection-write-local-settings conn)
+    (write-frame `(settings ,(conn-local-settings conn) #f))
+    conn)
+
+  (define (http-connection-read-peer-settings conn)
     (let* ((f (read-frame))
 	   (t (car f)))
       (if (not (eq? t 'settings))
 	  (conn-connection-error conn 0 'protocol-error "expecting settings frame")
 	  (conn-recv conn f identity))))
- 
-  (define (conn-read-client-preface conn)
-    (let* ((s (read-string 24)))
-      (if (string=? "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" s)
-	  conn
-	  (conn-connection-error conn 0 'protocol-error "bad client preface")))
-    conn)
   
-  (define (conn-write-server-preface conn)
-    (write-frame `(settings ,(conn-local-settings conn) #f))
-    conn)
- 
   (define (make-http-server-connection
 	   #!optional
 	   (in (current-input-port))
 	   (out (current-output-port)))
-    (conn-read-client-settings
-     (conn-read-client-preface
-      (conn-write-server-preface
+    (http-connection-read-peer-settings
+     (http-connection-read-client-preface
+      (http-connection-write-local-settings
        (make-conn mode: 'server
 		  in: in
 		  out: out
@@ -526,7 +518,6 @@
 
 ;;server
 (use tcp-server)
-(use openssl)
 
 (import http2)
 
@@ -540,14 +531,10 @@
 
 (define (make-http-server handler)
   (lambda (ignore)
-    (let* ((l (ssl-listen* port: 8000
-			   protocol: 'tlsv12
-			   certificate: "server.pem"
-			   private-key: "server.key"
-			   private-key-type: 'ec)))
+    (let* ((l (tcp-listen 8000)))
       (let lp ()
 	(receive (in out)
-	    (ssl-accept l)
+	    (tcp-accept l)
 	  (thread-start!
 	   (make-thread
 	    (lambda ()
